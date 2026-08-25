@@ -55,13 +55,25 @@ export class GmailProvider implements MailProvider {
     const clientId = import.meta.env.VITE_GOOGLE_CLIENT_ID;
     if (!clientId) throw new Error("VITE_GOOGLE_CLIENT_ID is not set — see README.md");
     return new Promise((resolve, reject) => {
+      // If the Google popup is blocked or the user closes it without acting,
+      // Google Identity Services may never invoke a callback — guard with a timeout
+      // so the UI can surface an error instead of hanging on "Loading…" forever.
+      const timeout = setTimeout(
+        () => reject(new Error("Sign-in timed out — check that popups are allowed for this site and try again")),
+        30000
+      );
       const client = window.google.accounts.oauth2.initTokenClient({
         client_id: clientId,
         scope: SCOPES,
         callback: (resp: any) => {
+          clearTimeout(timeout);
           if (resp.error) return reject(new Error(resp.error));
           this.token = resp.access_token;
           resolve(resp.access_token);
+        },
+        error_callback: (err: any) => {
+          clearTimeout(timeout);
+          reject(new Error(err?.type === "popup_closed" ? "Sign-in window closed before completing" : err?.message ?? "Sign-in failed"));
         },
       });
       client.requestAccessToken();
