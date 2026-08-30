@@ -259,7 +259,18 @@ export default function App() {
             </table>
           </section>
 
-          <RuleBuilder provider={provider} categories={categories} busy={busy} onExecute={execute} />
+          <RuleBuilder
+            provider={provider}
+            categories={categories}
+            busy={busy}
+            onExecute={(c) => {
+              // Route through the same confirm modal every other trash action
+              // uses, instead of running immediately — the Preview step alone
+              // isn't the same as an explicit "yes, trash these" confirmation.
+              setConfirm(c);
+              return Promise.resolve();
+            }}
+          />
         </div>
 
         <div className="trash-note">
