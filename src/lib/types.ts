@@ -60,15 +60,23 @@ export interface RulePreview {
  * to the Gmail REST API directly from the browser. Nothing here ever routes
  * mail data through a Gigback server — there isn't one.
  */
+export interface TrashResult {
+  count: number;
+  /** IDs actually moved to Trash — lets the caller offer a precise undo. */
+  ids: string[];
+}
+
 export interface MailProvider {
   readonly demo: boolean;
   connect(): Promise<Overview>;
-  /** Move messages to Gmail Trash (never permanent delete). Returns count trashed. */
-  trashMessages(ids: string[]): Promise<number>;
+  /** Move messages to Gmail Trash (never permanent delete). */
+  trashMessages(ids: string[]): Promise<TrashResult>;
   /** Trash everything from a sender (excluding starred/important). */
-  trashSender(email: string): Promise<number>;
+  trashSender(email: string): Promise<TrashResult>;
   previewRule(rule: Rule): Promise<RulePreview>;
-  runRule(rule: Rule): Promise<number>;
+  runRule(rule: Rule): Promise<TrashResult>;
+  /** Move messages back out of Trash. Returns count restored. */
+  restoreMessages(ids: string[]): Promise<number>;
   refresh(): Promise<Overview>;
 }
 

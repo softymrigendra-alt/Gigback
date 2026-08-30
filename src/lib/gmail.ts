@@ -10,6 +10,7 @@ import type {
   Rule,
   RulePreview,
   SenderStat,
+  TrashResult,
 } from "./types";
 
 const SCOPES = [
@@ -194,7 +195,7 @@ export class GmailProvider implements MailProvider {
     };
   }
 
-  async trashMessages(ids: string[]): Promise<number> {
+  async trashMessages(ids: string[]): Promise<TrashResult> {
     for (let i = 0; i < ids.length; i += 1000) {
       await this.api(`${GMAIL}/messages/batchModify`, {
         method: "POST",
@@ -205,12 +206,27 @@ export class GmailProvider implements MailProvider {
         }),
       });
     }
-    return ids.length;
+    return { count: ids.length, ids };
   }
 
-  async trashSender(email: string): Promise<number> {
+  async trashSender(email: string): Promise<TrashResult> {
     const ids = await this.listIds(`from:${email} -is:starred -is:important -in:trash`, 2000);
     if (ids.length) await this.trashMessages(ids);
+    return { count: ids.length, ids };
+  }
+
+  /** Reverses trashMessages: removes the TRASH label and restores INBOX. */
+  async restoreMessages(ids: string[]): Promise<number> {
+    for (let i = 0; i < ids.length; i += 1000) {
+      await this.api(`${GMAIL}/messages/batchModify`, {
+        method: "POST",
+        body: JSON.stringify({
+          ids: ids.slice(i, i + 1000),
+          addLabelIds: ["INBOX"],
+          removeLabelIds: ["TRASH"],
+        }),
+      });
+    }
     return ids.length;
   }
 
@@ -230,9 +246,9 @@ export class GmailProvider implements MailProvider {
     return { matched, estimatedBytes: matched * 300 * 1024, query };
   }
 
-  async runRule(rule: Rule): Promise<number> {
+  async runRule(rule: Rule): Promise<TrashResult> {
     const ids = await this.listIds(this.ruleQuery(rule), 2000);
     if (ids.length) await this.trashMessages(ids);
-    return ids.length;
+    return { count: ids.length, ids };
   }
 }

@@ -8,6 +8,7 @@ import type {
   Rule,
   RulePreview,
   SenderStat,
+  TrashResult,
 } from "./types";
 
 const SENDER_POOL: [string, string, number, number][] = [
@@ -101,9 +102,15 @@ function buildState() {
 
 const AVG_PROMO_BYTES = 380 * 1024; // rough per-message estimate for rule previews
 
+type State = ReturnType<typeof buildState>;
+
 export class DemoProvider implements MailProvider {
   readonly demo = true;
   private state = buildState();
+  // Snapshot of state right before the last mutating action, so "Undo" can
+  // restore exactly — simpler and safer than trying to reverse each of
+  // trashMessages/trashSender/runRule's different bookkeeping individually.
+  private undoSnapshot: { state: State; count: number } | null = null;
 
   private overview(): Overview {
     const s = this.state;
@@ -137,7 +144,12 @@ export class DemoProvider implements MailProvider {
     return this.delay(this.overview(), 200);
   }
 
-  trashMessages(ids: string[]) {
+  private snapshot(count: number) {
+    this.undoSnapshot = { state: structuredClone(this.state), count };
+  }
+
+  trashMessages(ids: string[]): Promise<TrashResult> {
+    this.snapshot(ids.length);
     const s = this.state;
     const idSet = new Set(ids);
     let freed = 0;
@@ -154,21 +166,32 @@ export class DemoProvider implements MailProvider {
     s.usageInGmailBytes -= freed;
     s.trashedBytes += freed;
     s.messagesTotal -= ids.length;
-    return this.delay(ids.length);
+    return this.delay({ count: ids.length, ids });
   }
 
-  trashSender(email: string) {
+  trashSender(email: string): Promise<TrashResult> {
     const s = this.state;
     const sender = s.senders.find((x) => x.email === email);
-    if (!sender) return this.delay(0);
+    if (!sender) return this.delay({ count: 0, ids: [] });
+    this.snapshot(sender.count);
     const n = sender.count;
+    const ids = s.largeMessages.filter((m) => m.fromEmail === email).map((m) => m.id);
     s.usageInGmailBytes -= sender.totalBytes;
     s.trashedBytes += sender.totalBytes;
     s.messagesTotal -= n;
     s.largeMessages = s.largeMessages.filter((m) => m.fromEmail !== email);
     sender.count = 0;
     sender.totalBytes = 0;
-    return this.delay(n, 700);
+    return this.delay({ count: n, ids }, 700);
+  }
+
+  /** Undo: restores the state captured right before the last trash action. */
+  restoreMessages(_ids: string[]): Promise<number> {
+    if (!this.undoSnapshot) return this.delay(0);
+    const { state, count } = this.undoSnapshot;
+    this.state = state;
+    this.undoSnapshot = null;
+    return this.delay(count, 300);
   }
 
   previewRule(rule: Rule): Promise<RulePreview> {
@@ -176,24 +199,27 @@ export class DemoProvider implements MailProvider {
     return this.delay({ matched, estimatedBytes, query }, 400);
   }
 
-  runRule(rule: Rule) {
+  runRule(rule: Rule): Promise<TrashResult> {
     const s = this.state;
     const { matched, estimatedBytes } = this.matchRule(rule);
+    this.snapshot(matched);
     if (rule.category) {
       const cat = s.categories.find((c) => c.key === rule.category);
       if (cat) cat.count -= matched;
     }
     const cutoff = Date.now() - rule.olderThanDays * 86400000;
-    s.largeMessages = s.largeMessages.filter(
-      (m) =>
+    const isMatch = (m: MailMessage) =>
+      !(
         new Date(m.date).getTime() > cutoff ||
         (rule.category ? !m.labels.includes(rule.category) : false) ||
         (rule.fromEmail ? m.fromEmail !== rule.fromEmail : false)
-    );
+      );
+    const ids = s.largeMessages.filter(isMatch).map((m) => m.id);
+    s.largeMessages = s.largeMessages.filter((m) => !isMatch(m));
     s.usageInGmailBytes -= estimatedBytes;
     s.trashedBytes += estimatedBytes;
     s.messagesTotal -= matched;
-    return this.delay(matched, 900);
+    return this.delay({ count: matched, ids }, 900);
   }
 
   private matchRule(rule: Rule) {

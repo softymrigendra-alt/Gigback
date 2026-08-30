@@ -168,4 +168,11 @@ section h2 + .section-sub { margin-bottom: 14px; }
   background: var(--panel-2); border: 1px solid var(--safe); color: var(--text);
   padding: 12px 20px; border-radius: 10px; font-size: 13.5px; z-index: 60;
   box-shadow: 0 8px 30px rgba(0, 0, 0, 0.45);
+  display: flex; align-items: center; gap: 14px;
 }
+.toast-undo {
+  background: none; border: none; color: var(--accent-2); font-weight: 700;
+  font-size: 13.5px; cursor: pointer; padding: 0; font-family: inherit;
+  text-decoration: underline;
+}
+.toast-undo:disabled { opacity: 0.5; cursor: default; }

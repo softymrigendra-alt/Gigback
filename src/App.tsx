@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import type { MailProvider, Overview, Recommendation, Rule } from "./lib/types";
+import type { MailProvider, Overview, Recommendation, Rule, TrashResult } from "./lib/types";
 import { DemoProvider } from "./lib/demo";
 import { GmailProvider, consumeRedirectToken, startGoogleSignIn } from "./lib/gmail";
 import { buildRecommendations } from "./lib/triage";
@@ -8,8 +8,10 @@ import { fmtBytes, fmtDate, fmtNum } from "./lib/format";
 type Confirm = {
   title: string;
   body: string;
-  run: () => Promise<number>;
+  run: () => Promise<TrashResult>;
 };
+
+type Toast = { message: string; onUndo?: () => void };
 
 export default function App() {
   const [provider, setProvider] = useState<MailProvider | null>(null);
@@ -20,7 +22,8 @@ export default function App() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [confirm, setConfirm] = useState<Confirm | null>(null);
   const [busy, setBusy] = useState(false);
-  const [toast, setToast] = useState<string | null>(null);
+  const [restoring, setRestoring] = useState(false);
+  const [toast, setToast] = useState<Toast | null>(null);
 
   const recs = useMemo(() => (overview ? buildRecommendations(overview) : []), [overview]);
 
@@ -38,9 +41,25 @@ export default function App() {
     }
   }
 
-  function showToast(msg: string) {
-    setToast(msg);
-    setTimeout(() => setToast(null), 4000);
+  function showToast(message: string, onUndo?: () => void) {
+    setToast({ message, onUndo });
+    setTimeout(() => setToast((t) => (t?.message === message ? null : t)), 8000);
+  }
+
+  async function undo(ids: string[], estimatedBytes: number) {
+    if (!provider) return;
+    setRestoring(true);
+    try {
+      const n = await provider.restoreMessages(ids);
+      const o = await provider.refresh();
+      setOverview(o);
+      setFreedBytes((f) => Math.max(0, f - estimatedBytes));
+      showToast(`Restored ${fmtNum(n)} emails from Trash`);
+    } catch (e: any) {
+      showToast(`Undo failed: ${e.message ?? e}`);
+    } finally {
+      setRestoring(false);
+    }
   }
 
   // If we just landed back from Google's redirect-based sign-in, pick the
@@ -58,12 +77,15 @@ export default function App() {
   async function execute(c: Confirm, estimatedBytes: number) {
     setBusy(true);
     try {
-      const n = await c.run();
+      const { count, ids } = await c.run();
       const o = await provider!.refresh();
       setOverview(o);
       setSelected(new Set());
       setFreedBytes((f) => f + estimatedBytes);
-      showToast(`Moved ${fmtNum(n)} emails to Trash — ~${fmtBytes(estimatedBytes)} queued to free`);
+      showToast(
+        `Moved ${fmtNum(count)} emails to Trash — ~${fmtBytes(estimatedBytes)} queued to free`,
+        ids.length ? () => undo(ids, estimatedBytes) : undefined
+      );
     } catch (e: any) {
       showToast(`Failed: ${e.message ?? e}`);
     } finally {
@@ -276,7 +298,16 @@ export default function App() {
         </div>
       )}
 
-      {toast && <div className="toast">{toast}</div>}
+      {toast && (
+        <div className="toast">
+          {toast.message}
+          {toast.onUndo && (
+            <button className="toast-undo" disabled={restoring} onClick={toast.onUndo}>
+              {restoring ? "Restoring…" : "Undo"}
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }
