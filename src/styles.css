@@ -150,6 +150,7 @@ section h2 + .section-sub { margin-bottom: 14px; }
 .landing-points li { margin-bottom: 7px; }
 .landing-actions { display: flex; gap: 12px; justify-content: center; }
 .landing-error { color: var(--danger); margin-top: 16px; font-size: 13px; }
+.landing-hint { color: var(--dim); margin-top: 16px; font-size: 13px; }
 
 /* Modal + toast */
 .modal-backdrop {

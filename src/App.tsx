@@ -1,7 +1,7 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { MailProvider, Overview, Recommendation, Rule } from "./lib/types";
 import { DemoProvider } from "./lib/demo";
-import { GmailProvider } from "./lib/gmail";
+import { GmailProvider, consumeRedirectToken, startGoogleSignIn } from "./lib/gmail";
 import { buildRecommendations } from "./lib/triage";
 import { fmtBytes, fmtDate, fmtNum } from "./lib/format";
 
@@ -43,6 +43,18 @@ export default function App() {
     setTimeout(() => setToast(null), 4000);
   }
 
+  // If we just landed back from Google's redirect-based sign-in, pick the
+  // token out of the URL and finish connecting automatically.
+  useEffect(() => {
+    try {
+      const token = consumeRedirectToken();
+      if (token) start(new GmailProvider(token));
+    } catch (e: any) {
+      setError(e.message ?? String(e));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   async function execute(c: Confirm, estimatedBytes: number) {
     setBusy(true);
     try {
@@ -66,7 +78,7 @@ export default function App() {
         loading={loading}
         error={error}
         onDemo={() => start(new DemoProvider())}
-        onConnect={() => start(new GmailProvider())}
+        onConnect={startGoogleSignIn}
       />
     );
   }
@@ -108,6 +120,7 @@ export default function App() {
                 <RecCard
                   key={r.id}
                   rec={r}
+                  disabled={busy}
                   onRun={() =>
                     setConfirm({
                       title: r.title,
@@ -305,6 +318,7 @@ function Landing(props: {
             {props.loading ? "Loading…" : "Try the demo"}
           </button>
         </div>
+        {props.loading && <p className="landing-hint">Scanning your mailbox for large emails and senders — this can take up to 10-15 seconds on a full inbox.</p>}
         {props.error && <p className="landing-error">{props.error}</p>}
       </div>
     </div>
@@ -357,7 +371,7 @@ function StorageBar({ quota, messagesTotal }: { quota: Overview["quota"]; messag
   );
 }
 
-function RecCard({ rec, onRun }: { rec: Recommendation; onRun: () => void }) {
+function RecCard({ rec, disabled, onRun }: { rec: Recommendation; disabled: boolean; onRun: () => void }) {
   return (
     <div className="rec-card">
       <div className="rec-top">
@@ -368,7 +382,7 @@ function RecCard({ rec, onRun }: { rec: Recommendation; onRun: () => void }) {
       </div>
       <h3>{rec.title}</h3>
       <p>{rec.detail}</p>
-      <button className="btn btn-primary btn-small" onClick={onRun}>
+      <button className="btn btn-primary btn-small" disabled={disabled} onClick={onRun}>
         Clean up
       </button>
     </div>

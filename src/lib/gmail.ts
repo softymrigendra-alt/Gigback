@@ -20,21 +20,43 @@ const SCOPES = [
 const GMAIL = "https://gmail.googleapis.com/gmail/v1/users/me";
 const DRIVE_ABOUT = "https://www.googleapis.com/drive/v3/about?fields=storageQuota";
 
-declare global {
-  interface Window {
-    google?: any;
-  }
+// Redirect-based OAuth (implicit grant), not a popup: browsers, extensions,
+// and mobile Safari routinely block or silently kill popups, which left the
+// old popup-based flow stuck on "closed before completing" for real users.
+// A full-page redirect can't be blocked, at the cost of a page reload.
+function buildAuthUrl(): string {
+  const clientId = import.meta.env.VITE_GOOGLE_CLIENT_ID;
+  if (!clientId) throw new Error("VITE_GOOGLE_CLIENT_ID is not set — see README.md");
+  const params = new URLSearchParams({
+    client_id: clientId,
+    redirect_uri: window.location.origin,
+    response_type: "token",
+    scope: SCOPES,
+    include_granted_scopes: "true",
+    prompt: "select_account",
+  });
+  return `https://accounts.google.com/o/oauth2/v2/auth?${params}`;
 }
 
-function loadGis(): Promise<void> {
-  if (window.google?.accounts?.oauth2) return Promise.resolve();
-  return new Promise((resolve, reject) => {
-    const s = document.createElement("script");
-    s.src = "https://accounts.google.com/gsi/client";
-    s.onload = () => resolve();
-    s.onerror = () => reject(new Error("Failed to load Google Identity Services"));
-    document.head.appendChild(s);
-  });
+/** Call from a click handler to start sign-in. Navigates away immediately. */
+export function startGoogleSignIn(): void {
+  window.location.assign(buildAuthUrl());
+}
+
+/**
+ * Call once on app load to check whether we just landed back from Google's
+ * redirect. Strips the token out of the URL fragment immediately so it
+ * doesn't linger in the address bar or browser history.
+ */
+export function consumeRedirectToken(): string | null {
+  if (!window.location.hash) return null;
+  const params = new URLSearchParams(window.location.hash.slice(1));
+  const token = params.get("access_token");
+  const error = params.get("error");
+  if (!token && !error) return null;
+  history.replaceState(null, "", window.location.pathname + window.location.search);
+  if (error) throw new Error(`Google sign-in failed: ${error}`);
+  return token;
 }
 
 const CATEGORY_LABELS: Record<string, string> = {
@@ -47,45 +69,19 @@ const CATEGORY_LABELS: Record<string, string> = {
 
 export class GmailProvider implements MailProvider {
   readonly demo = false;
-  private token: string | null = null;
+  private token: string | null;
 
-  private async authorize(): Promise<string> {
-    if (this.token) return this.token;
-    await loadGis();
-    const clientId = import.meta.env.VITE_GOOGLE_CLIENT_ID;
-    if (!clientId) throw new Error("VITE_GOOGLE_CLIENT_ID is not set — see README.md");
-    return new Promise((resolve, reject) => {
-      // If the Google popup is blocked or the user closes it without acting,
-      // Google Identity Services may never invoke a callback — guard with a timeout
-      // so the UI can surface an error instead of hanging on "Loading…" forever.
-      const timeout = setTimeout(
-        () => reject(new Error("Sign-in timed out — check that popups are allowed for this site and try again")),
-        30000
-      );
-      const client = window.google.accounts.oauth2.initTokenClient({
-        client_id: clientId,
-        scope: SCOPES,
-        callback: (resp: any) => {
-          clearTimeout(timeout);
-          if (resp.error) return reject(new Error(resp.error));
-          this.token = resp.access_token;
-          resolve(resp.access_token);
-        },
-        error_callback: (err: any) => {
-          clearTimeout(timeout);
-          reject(new Error(err?.type === "popup_closed" ? "Sign-in window closed before completing" : err?.message ?? "Sign-in failed"));
-        },
-      });
-      client.requestAccessToken();
-    });
+  /** token comes from consumeRedirectToken() after Google redirects back. */
+  constructor(token: string) {
+    this.token = token;
   }
 
   private async api<T>(url: string, init?: RequestInit): Promise<T> {
-    const token = await this.authorize();
+    if (!this.token) throw new Error('Not signed in — click "Connect Gmail" to continue.');
     const res = await fetch(url, {
       ...init,
       headers: {
-        Authorization: `Bearer ${token}`,
+        Authorization: `Bearer ${this.token}`,
         "Content-Type": "application/json",
         ...(init?.headers ?? {}),
       },
@@ -112,7 +108,7 @@ export class GmailProvider implements MailProvider {
     return ids;
   }
 
-  private async getMetadata(ids: string[], concurrency = 15): Promise<MailMessage[]> {
+  private async getMetadata(ids: string[], concurrency = 30): Promise<MailMessage[]> {
     const out: MailMessage[] = [];
     for (let i = 0; i < ids.length; i += concurrency) {
       const chunk = await Promise.all(
@@ -142,7 +138,6 @@ export class GmailProvider implements MailProvider {
   }
 
   async connect(): Promise<Overview> {
-    await this.authorize();
     return this.refresh();
   }
 
@@ -159,15 +154,18 @@ export class GmailProvider implements MailProvider {
       })
     );
 
-    // Large messages: everything over 5MB, capped for the prototype.
-    const largeIds = await this.listIds("larger:5M -in:trash", 200);
-    const largeMessages = (await this.getMetadata(largeIds)).sort((a, b) => b.sizeBytes - a.sizeBytes);
+    // One fetch pass covers both the largest-emails table and the top-senders
+    // aggregation — previously these were two separate scans (200 + 600
+    // individual message.get() calls, ~800 total), which made the first
+    // connect take 15-20+ seconds. Reusing a single "larger:1M" sample for
+    // both cuts that to ~300 calls and keeps both views consistent with
+    // each other.
+    const ids = await this.listIds("larger:1M -in:trash", 300);
+    const messages = await this.getMetadata(ids);
+    const largeMessages = [...messages].sort((a, b) => b.sizeBytes - a.sizeBytes);
 
-    // Top senders: sample recent messages >100KB and aggregate (approximation).
-    const sampleIds = await this.listIds("larger:100K -in:trash", 600);
-    const sample = await this.getMetadata(sampleIds);
     const bySender = new Map<string, SenderStat>();
-    for (const m of sample) {
+    for (const m of messages) {
       const match = m.from.match(/^(.*?)\s*<(.+)>$/);
       const name = match ? match[1].replace(/^"|"$/g, "") : m.fromEmail;
       const cur = bySender.get(m.fromEmail) ?? { email: m.fromEmail, name, count: 0, totalBytes: 0 };
