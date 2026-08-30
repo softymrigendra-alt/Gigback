@@ -13,6 +13,14 @@ type Confirm = {
 
 type Toast = { message: string; onUndo?: () => void };
 
+type HistoryEntry = {
+  id: string;
+  label: string;
+  ids: string[];
+  estimatedBytes: number;
+  count: number;
+};
+
 export default function App() {
   const [provider, setProvider] = useState<MailProvider | null>(null);
   const [overview, setOverview] = useState<Overview | null>(null);
@@ -22,8 +30,10 @@ export default function App() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [confirm, setConfirm] = useState<Confirm | null>(null);
   const [busy, setBusy] = useState(false);
-  const [restoring, setRestoring] = useState(false);
+  // id of the history entry currently being restored, or null if none
+  const [restoring, setRestoring] = useState<string | null>(null);
   const [toast, setToast] = useState<Toast | null>(null);
+  const [history, setHistory] = useState<HistoryEntry[]>([]);
 
   const recs = useMemo(() => (overview ? buildRecommendations(overview) : []), [overview]);
 
@@ -46,19 +56,20 @@ export default function App() {
     setTimeout(() => setToast((t) => (t?.message === message ? null : t)), 8000);
   }
 
-  async function undo(ids: string[], estimatedBytes: number) {
+  async function undoEntry(entry: HistoryEntry) {
     if (!provider) return;
-    setRestoring(true);
+    setRestoring(entry.id);
     try {
-      const n = await provider.restoreMessages(ids);
+      const n = await provider.restoreMessages(entry.ids);
       const o = await provider.refresh();
       setOverview(o);
-      setFreedBytes((f) => Math.max(0, f - estimatedBytes));
+      setFreedBytes((f) => Math.max(0, f - entry.estimatedBytes));
+      setHistory((h) => h.filter((x) => x.id !== entry.id));
       showToast(`Restored ${fmtNum(n)} emails from Trash`);
     } catch (e: any) {
       showToast(`Undo failed: ${e.message ?? e}`);
     } finally {
-      setRestoring(false);
+      setRestoring(null);
     }
   }
 
@@ -82,9 +93,20 @@ export default function App() {
       setOverview(o);
       setSelected(new Set());
       setFreedBytes((f) => f + estimatedBytes);
+      let entry: HistoryEntry | null = null;
+      if (ids.length) {
+        entry = {
+          id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+          label: c.title.replace(/\?$/, ""),
+          ids,
+          estimatedBytes,
+          count,
+        };
+        setHistory((h) => [entry!, ...h].slice(0, 8));
+      }
       showToast(
         `Moved ${fmtNum(count)} emails to Trash — ~${fmtBytes(estimatedBytes)} queued to free`,
-        ids.length ? () => undo(ids, estimatedBytes) : undefined
+        entry ? () => undoEntry(entry!) : undefined
       );
     } catch (e: any) {
       showToast(`Failed: ${e.message ?? e}`);
@@ -130,6 +152,28 @@ export default function App() {
 
       <main>
         <StorageBar quota={quota} messagesTotal={profile.messagesTotal} />
+
+        {history.length > 0 && (
+          <section>
+            <h2>Recent actions</h2>
+            <p className="section-sub">Undo any of your last {history.length} cleanups — restores mail straight out of Trash.</p>
+            <div className="history-list">
+              {history.map((h) => (
+                <div className="history-row" key={h.id}>
+                  <div>
+                    <div className="history-label">{h.label}</div>
+                    <div className="cell-dim">
+                      {fmtNum(h.count)} emails · ~{fmtBytes(h.estimatedBytes)}
+                    </div>
+                  </div>
+                  <button className="btn btn-small" disabled={restoring !== null} onClick={() => undoEntry(h)}>
+                    {restoring === h.id ? "Restoring…" : "Undo"}
+                  </button>
+                </div>
+              ))}
+            </div>
+          </section>
+        )}
 
         {recs.length > 0 && (
           <section>
@@ -313,8 +357,8 @@ export default function App() {
         <div className="toast">
           {toast.message}
           {toast.onUndo && (
-            <button className="toast-undo" disabled={restoring} onClick={toast.onUndo}>
-              {restoring ? "Restoring…" : "Undo"}
+            <button className="toast-undo" disabled={restoring !== null} onClick={toast.onUndo}>
+              {restoring !== null ? "Restoring…" : "Undo"}
             </button>
           )}
         </div>

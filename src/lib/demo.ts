@@ -101,16 +101,32 @@ function buildState() {
 }
 
 const AVG_PROMO_BYTES = 380 * 1024; // rough per-message estimate for rule previews
+const MAX_HISTORY = 10;
 
-type State = ReturnType<typeof buildState>;
+interface HistoryEntry {
+  key: string; // ids sorted+joined — how restoreMessages() finds the matching entry
+  ids: string[];
+  messages: MailMessage[]; // full removed rows, to reinsert into largeMessages
+  usageDelta: number; // bytes to add back to usageInGmailBytes
+  messagesTotalDelta: number;
+  senderDeltas: { email: string; countDelta: number; bytesDelta: number }[];
+  categoryKey?: string;
+  categoryDelta?: number;
+}
 
 export class DemoProvider implements MailProvider {
   readonly demo = true;
   private state = buildState();
-  // Snapshot of state right before the last mutating action, so "Undo" can
-  // restore exactly — simpler and safer than trying to reverse each of
-  // trashMessages/trashSender/runRule's different bookkeeping individually.
-  private undoSnapshot: { state: State; count: number } | null = null;
+  // Per-action reversible deltas (not a single whole-state snapshot) so any
+  // of the last several actions can be undone independently, in any order —
+  // undoing an older one doesn't clobber a newer one that happened after it.
+  private history: HistoryEntry[] = [];
+
+  private pushHistory(entry: Omit<HistoryEntry, "key">) {
+    const key = [...entry.ids].sort().join(",");
+    this.history.unshift({ key, ...entry });
+    if (this.history.length > MAX_HISTORY) this.history.length = MAX_HISTORY;
+  }
 
   private overview(): Overview {
     const s = this.state;
@@ -144,54 +160,86 @@ export class DemoProvider implements MailProvider {
     return this.delay(this.overview(), 200);
   }
 
-  private snapshot(count: number) {
-    this.undoSnapshot = { state: structuredClone(this.state), count };
-  }
-
   trashMessages(ids: string[]): Promise<TrashResult> {
-    this.snapshot(ids.length);
     const s = this.state;
     const idSet = new Set(ids);
+    const removed = s.largeMessages.filter((m) => idSet.has(m.id));
+    const bySender = new Map<string, { countDelta: number; bytesDelta: number }>();
     let freed = 0;
-    s.largeMessages = s.largeMessages.filter((m) => {
-      if (!idSet.has(m.id)) return true;
+    for (const m of removed) {
       freed += m.sizeBytes;
       const sender = s.senders.find((x) => x.email === m.fromEmail);
       if (sender) {
         sender.count -= 1;
         sender.totalBytes = Math.max(0, sender.totalBytes - m.sizeBytes);
+        const d = bySender.get(m.fromEmail) ?? { countDelta: 0, bytesDelta: 0 };
+        d.countDelta += 1;
+        d.bytesDelta += m.sizeBytes;
+        bySender.set(m.fromEmail, d);
       }
-      return false;
-    });
+    }
+    s.largeMessages = s.largeMessages.filter((m) => !idSet.has(m.id));
     s.usageInGmailBytes -= freed;
     s.trashedBytes += freed;
     s.messagesTotal -= ids.length;
+    this.pushHistory({
+      ids,
+      messages: removed,
+      usageDelta: freed,
+      messagesTotalDelta: ids.length,
+      senderDeltas: [...bySender.entries()].map(([email, d]) => ({ email, ...d })),
+    });
     return this.delay({ count: ids.length, ids });
   }
 
   trashSender(email: string): Promise<TrashResult> {
     const s = this.state;
     const sender = s.senders.find((x) => x.email === email);
-    if (!sender) return this.delay({ count: 0, ids: [] });
-    this.snapshot(sender.count);
+    if (!sender || sender.count === 0) return this.delay({ count: 0, ids: [] });
     const n = sender.count;
-    const ids = s.largeMessages.filter((m) => m.fromEmail === email).map((m) => m.id);
-    s.usageInGmailBytes -= sender.totalBytes;
-    s.trashedBytes += sender.totalBytes;
+    const totalBytes = sender.totalBytes;
+    const removed = s.largeMessages.filter((m) => m.fromEmail === email);
+    const ids = removed.map((m) => m.id);
+    s.usageInGmailBytes -= totalBytes;
+    s.trashedBytes += totalBytes;
     s.messagesTotal -= n;
     s.largeMessages = s.largeMessages.filter((m) => m.fromEmail !== email);
     sender.count = 0;
     sender.totalBytes = 0;
+    this.pushHistory({
+      ids,
+      messages: removed,
+      usageDelta: totalBytes,
+      messagesTotalDelta: n,
+      senderDeltas: [{ email, countDelta: n, bytesDelta: totalBytes }],
+    });
     return this.delay({ count: n, ids }, 700);
   }
 
-  /** Undo: restores the state captured right before the last trash action. */
-  restoreMessages(_ids: string[]): Promise<number> {
-    if (!this.undoSnapshot) return this.delay(0);
-    const { state, count } = this.undoSnapshot;
-    this.state = state;
-    this.undoSnapshot = null;
-    return this.delay(count, 300);
+  /** Undo: reverses whichever tracked action produced exactly this id set. */
+  restoreMessages(ids: string[]): Promise<number> {
+    const key = [...ids].sort().join(",");
+    const idx = this.history.findIndex((h) => h.key === key);
+    if (idx === -1) return this.delay(0);
+    const entry = this.history[idx];
+    this.history.splice(idx, 1);
+    const s = this.state;
+    s.largeMessages = [...s.largeMessages, ...entry.messages].sort((a, b) => b.sizeBytes - a.sizeBytes);
+    s.usageInGmailBytes += entry.usageDelta;
+    s.trashedBytes -= entry.usageDelta;
+    s.messagesTotal += entry.messagesTotalDelta;
+    for (const d of entry.senderDeltas) {
+      const sender = s.senders.find((x) => x.email === d.email);
+      if (sender) {
+        sender.count += d.countDelta;
+        sender.totalBytes += d.bytesDelta;
+      }
+    }
+    if (entry.categoryKey) {
+      const cat = s.categories.find((c) => c.key === entry.categoryKey);
+      if (cat) cat.count += entry.categoryDelta ?? 0;
+    }
+    return this.delay(entry.messagesTotalDelta, 300);
   }
 
   previewRule(rule: Rule): Promise<RulePreview> {
@@ -202,10 +250,15 @@ export class DemoProvider implements MailProvider {
   runRule(rule: Rule): Promise<TrashResult> {
     const s = this.state;
     const { matched, estimatedBytes } = this.matchRule(rule);
-    this.snapshot(matched);
+    let categoryKey: string | undefined;
+    let categoryDelta = 0;
     if (rule.category) {
       const cat = s.categories.find((c) => c.key === rule.category);
-      if (cat) cat.count -= matched;
+      if (cat) {
+        cat.count -= matched;
+        categoryKey = rule.category;
+        categoryDelta = matched;
+      }
     }
     const cutoff = Date.now() - rule.olderThanDays * 86400000;
     const isMatch = (m: MailMessage) =>
@@ -214,11 +267,21 @@ export class DemoProvider implements MailProvider {
         (rule.category ? !m.labels.includes(rule.category) : false) ||
         (rule.fromEmail ? m.fromEmail !== rule.fromEmail : false)
       );
-    const ids = s.largeMessages.filter(isMatch).map((m) => m.id);
+    const removed = s.largeMessages.filter(isMatch);
+    const ids = removed.map((m) => m.id);
     s.largeMessages = s.largeMessages.filter((m) => !isMatch(m));
     s.usageInGmailBytes -= estimatedBytes;
     s.trashedBytes += estimatedBytes;
     s.messagesTotal -= matched;
+    this.pushHistory({
+      ids,
+      messages: removed,
+      usageDelta: estimatedBytes,
+      messagesTotalDelta: matched,
+      senderDeltas: [],
+      categoryKey,
+      categoryDelta,
+    });
     return this.delay({ count: matched, ids }, 900);
   }
 
