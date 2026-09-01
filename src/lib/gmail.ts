@@ -50,12 +50,31 @@ export function startGoogleSignIn(): void {
   window.location.assign(buildAuthUrl());
 }
 
+export interface GoogleSession {
+  token: string;
+  /** Epoch ms when Google's access token stops working (~1h from grant). */
+  expiresAt: number;
+}
+
+/**
+ * Thrown when the access token is gone or rejected. Distinct from other API
+ * failures so the UI can offer "Reconnect" instead of a dead-end error —
+ * the token is memory-only and implicit-grant has no refresh token, so
+ * re-consent is the only recovery.
+ */
+export class AuthExpiredError extends Error {
+  constructor(message = "Your Google session expired.") {
+    super(message);
+    this.name = "AuthExpiredError";
+  }
+}
+
 /**
  * Call once on app load to check whether we just landed back from Google's
  * redirect. Strips the token out of the URL fragment immediately so it
  * doesn't linger in the address bar or browser history.
  */
-export function consumeRedirectToken(): string | null {
+export function consumeRedirectToken(): GoogleSession | null {
   if (!window.location.hash) return null;
   const params = new URLSearchParams(window.location.hash.slice(1));
   const token = params.get("access_token");
@@ -63,7 +82,10 @@ export function consumeRedirectToken(): string | null {
   if (!token && !error) return null;
   history.replaceState(null, "", window.location.pathname + window.location.search);
   if (error) throw new Error(`Google sign-in failed: ${error}`);
-  return token;
+  // Trust Google's expires_in, minus a small safety margin so we surface
+  // "reconnect" before a request fails rather than after.
+  const expiresIn = Number(params.get("expires_in")) || 3600;
+  return { token: token!, expiresAt: Date.now() + (expiresIn - 60) * 1000 };
 }
 
 const CATEGORY_LABELS: Record<string, string> = {
@@ -76,11 +98,16 @@ const CATEGORY_LABELS: Record<string, string> = {
 
 export class GmailProvider implements MailProvider {
   readonly demo = false;
-  private token: string | null;
+  private session: GoogleSession | null;
 
-  /** token comes from consumeRedirectToken() after Google redirects back. */
-  constructor(token: string) {
-    this.token = token;
+  /** session comes from consumeRedirectToken() after Google redirects back. */
+  constructor(session: GoogleSession) {
+    this.session = session;
+  }
+
+  /** ms until the token lapses; <= 0 means it already has. */
+  msUntilExpiry(): number {
+    return this.session ? this.session.expiresAt - Date.now() : 0;
   }
 
   /**
@@ -90,18 +117,23 @@ export class GmailProvider implements MailProvider {
    * whole scan.
    */
   private async api<T>(url: string, init?: RequestInit, attempt = 0): Promise<T> {
-    if (!this.token) throw new Error('Not signed in — click "Connect Gmail" to continue.');
+    // Check expiry locally first — cheaper than a round trip, and it means a
+    // long scan fails fast at the start instead of halfway through.
+    if (!this.session || this.msUntilExpiry() <= 0) {
+      this.session = null;
+      throw new AuthExpiredError();
+    }
     const res = await fetch(url, {
       ...init,
       headers: {
-        Authorization: `Bearer ${this.token}`,
+        Authorization: `Bearer ${this.session.token}`,
         "Content-Type": "application/json",
         ...(init?.headers ?? {}),
       },
     });
     if (res.status === 401) {
-      this.token = null;
-      throw new Error("Your Google session expired — reload the page and reconnect to continue.");
+      this.session = null;
+      throw new AuthExpiredError();
     }
     if ((res.status === 429 || res.status >= 500) && attempt < MAX_RETRIES) {
       const backoff = 2 ** attempt * 500 + Math.random() * 250;

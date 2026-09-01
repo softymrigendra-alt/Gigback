@@ -80,6 +80,11 @@ export interface MailProvider {
   /** Move messages back out of Trash. Returns count restored. */
   restoreMessages(ids: string[]): Promise<number>;
   refresh(): Promise<Overview>;
+  /**
+   * ms until credentials lapse. Only GmailProvider implements this — demo
+   * mode has no session to expire.
+   */
+  msUntilExpiry?(): number;
 }
 
 export interface Recommendation {

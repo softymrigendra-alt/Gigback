@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import type { MailProvider, Overview, Recommendation, Rule, RulePreview, TrashResult } from "./lib/types";
 import { DemoProvider } from "./lib/demo";
-import { GmailProvider, consumeRedirectToken, startGoogleSignIn } from "./lib/gmail";
+import { AuthExpiredError, GmailProvider, consumeRedirectToken, startGoogleSignIn } from "./lib/gmail";
+import { loadUndoState, saveUndoState } from "./lib/session";
 import { buildRecommendations } from "./lib/triage";
 import { fmtBytes, fmtDate, fmtNum } from "./lib/format";
 
@@ -40,8 +41,20 @@ export default function App() {
   const [restoring, setRestoring] = useState<string | null>(null);
   const [toast, setToast] = useState<Toast | null>(null);
   const [history, setHistory] = useState<HistoryEntry[]>([]);
+  // Set when Google credentials lapse mid-session; drives the reconnect prompt
+  // instead of leaving every button dead with a generic error.
+  const [authExpired, setAuthExpired] = useState(false);
 
   const recs = useMemo(() => (overview ? buildRecommendations(overview) : []), [overview]);
+
+  /** Route auth failures to the reconnect prompt; return true if handled. */
+  function handleAuthError(e: unknown): boolean {
+    if (e instanceof AuthExpiredError) {
+      setAuthExpired(true);
+      return true;
+    }
+    return false;
+  }
 
   async function start(p: MailProvider) {
     setLoading(true);
@@ -50,7 +63,17 @@ export default function App() {
       const o = await p.connect();
       setProvider(p);
       setOverview(o);
+      // Recover an undo list left behind by a reload or a re-auth redirect,
+      // but only for a real account — demo state resets on reload anyway.
+      if (!p.demo) {
+        const saved = loadUndoState(o.profile.email);
+        if (saved) {
+          setHistory(saved.history);
+          setFreedBytes(saved.freedBytes);
+        }
+      }
     } catch (e: any) {
+      if (handleAuthError(e)) return;
       setError(e.message ?? String(e));
     } finally {
       setLoading(false);
@@ -61,6 +84,13 @@ export default function App() {
     setToast({ message, onUndo });
     setTimeout(() => setToast((t) => (t?.message === message ? null : t)), 8000);
   }
+
+  // Keep the persisted undo list in step with state, so a reload or an
+  // expiry-driven redirect can pick it back up.
+  useEffect(() => {
+    if (!provider || provider.demo || !overview) return;
+    saveUndoState(overview.profile.email, freedBytes, history);
+  }, [provider, overview, freedBytes, history]);
 
   async function undoEntry(entry: HistoryEntry) {
     if (!provider) return;
@@ -73,6 +103,7 @@ export default function App() {
       setHistory((h) => h.filter((x) => x.id !== entry.id));
       showToast(`Restored ${fmtNum(n)} emails from Trash`);
     } catch (e: any) {
+      if (handleAuthError(e)) return;
       showToast(`Undo failed: ${e.message ?? e}`);
     } finally {
       setRestoring(null);
@@ -83,8 +114,8 @@ export default function App() {
   // token out of the URL and finish connecting automatically.
   useEffect(() => {
     try {
-      const token = consumeRedirectToken();
-      if (token) start(new GmailProvider(token));
+      const session = consumeRedirectToken();
+      if (session) start(new GmailProvider(session));
     } catch (e: any) {
       setError(e.message ?? String(e));
     }
@@ -115,7 +146,7 @@ export default function App() {
         entry ? () => undoEntry(entry!) : undefined
       );
     } catch (e: any) {
-      showToast(`Failed: ${e.message ?? e}`);
+      if (!handleAuthError(e)) showToast(`Failed: ${e.message ?? e}`);
     } finally {
       setBusy(false);
       setConfirm(null);
@@ -341,7 +372,25 @@ export default function App() {
         </div>
       </main>
 
-      {confirm && (
+      {authExpired && (
+        <div className="modal-backdrop">
+          <div className="modal">
+            <h3>Reconnect to continue</h3>
+            <p>
+              Google sessions last about an hour, and Gigback holds the token in memory only — so it
+              can't refresh silently. Nothing you've already cleaned up is affected, and your
+              {history.length > 0 ? " undo list is kept" : " progress is kept"}.
+            </p>
+            <div className="modal-actions">
+              <button className="btn btn-primary" onClick={startGoogleSignIn}>
+                Reconnect Gmail
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {confirm && !authExpired && (
         <div className="modal-backdrop" onClick={() => !busy && setConfirm(null)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
             <h3>{confirm.title}</h3>
