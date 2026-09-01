@@ -21,6 +21,12 @@ const SCOPES = [
 const GMAIL = "https://gmail.googleapis.com/gmail/v1/users/me";
 const DRIVE_ABOUT = "https://www.googleapis.com/drive/v3/about?fields=storageQuota";
 
+const MAX_RETRIES = 4;
+/** Max messages one rule run will trash. previewRule reports this same cap. */
+const RULE_CAP = 2000;
+/** Messages sampled to derive a real mean size for rule estimates. */
+const SIZE_SAMPLE = 25;
+
 // Redirect-based OAuth (implicit grant), not a popup: browsers, extensions,
 // and mobile Safari routinely block or silently kill popups, which left the
 // old popup-based flow stuck on "closed before completing" for real users.
@@ -77,7 +83,13 @@ export class GmailProvider implements MailProvider {
     this.token = token;
   }
 
-  private async api<T>(url: string, init?: RequestInit): Promise<T> {
+  /**
+   * Gmail allows 250 quota units/sec/user and messages.get costs 5, so a wide
+   * metadata scan reliably trips 429s on a large mailbox. Retry those (and
+   * transient 5xx) with exponential backoff + jitter rather than failing the
+   * whole scan.
+   */
+  private async api<T>(url: string, init?: RequestInit, attempt = 0): Promise<T> {
     if (!this.token) throw new Error('Not signed in — click "Connect Gmail" to continue.');
     const res = await fetch(url, {
       ...init,
@@ -88,8 +100,13 @@ export class GmailProvider implements MailProvider {
       },
     });
     if (res.status === 401) {
-      this.token = null; // token expired — re-run authorize on next call
-      throw new Error("Session expired, please retry");
+      this.token = null;
+      throw new Error("Your Google session expired — reload the page and reconnect to continue.");
+    }
+    if ((res.status === 429 || res.status >= 500) && attempt < MAX_RETRIES) {
+      const backoff = 2 ** attempt * 500 + Math.random() * 250;
+      await new Promise((r) => setTimeout(r, backoff));
+      return this.api<T>(url, init, attempt + 1);
     }
     if (!res.ok) throw new Error(`Google API error ${res.status}: ${await res.text()}`);
     return res.status === 204 ? (undefined as T) : res.json();
@@ -197,13 +214,13 @@ export class GmailProvider implements MailProvider {
 
   async trashMessages(ids: string[]): Promise<TrashResult> {
     for (let i = 0; i < ids.length; i += 1000) {
+      // Only ADD the TRASH label — never strip INBOX. Adding TRASH already
+      // removes the message from the inbox view, and leaving the rest of the
+      // label set untouched is what makes restoreMessages a lossless inverse.
+      // (Stripping INBOX here meant archived mail came back into the inbox.)
       await this.api(`${GMAIL}/messages/batchModify`, {
         method: "POST",
-        body: JSON.stringify({
-          ids: ids.slice(i, i + 1000),
-          addLabelIds: ["TRASH"],
-          removeLabelIds: ["INBOX"],
-        }),
+        body: JSON.stringify({ ids: ids.slice(i, i + 1000), addLabelIds: ["TRASH"] }),
       });
     }
     return { count: ids.length, ids };
@@ -215,16 +232,16 @@ export class GmailProvider implements MailProvider {
     return { count: ids.length, ids };
   }
 
-  /** Reverses trashMessages: removes the TRASH label and restores INBOX. */
+  /**
+   * Exact inverse of trashMessages: drops the TRASH label and nothing else,
+   * so each message returns to wherever its own labels already put it —
+   * inbox mail to the inbox, archived mail back to archived.
+   */
   async restoreMessages(ids: string[]): Promise<number> {
     for (let i = 0; i < ids.length; i += 1000) {
       await this.api(`${GMAIL}/messages/batchModify`, {
         method: "POST",
-        body: JSON.stringify({
-          ids: ids.slice(i, i + 1000),
-          addLabelIds: ["INBOX"],
-          removeLabelIds: ["TRASH"],
-        }),
+        body: JSON.stringify({ ids: ids.slice(i, i + 1000), removeLabelIds: ["TRASH"] }),
       });
     }
     return ids.length;
@@ -240,14 +257,26 @@ export class GmailProvider implements MailProvider {
 
   async previewRule(rule: Rule): Promise<RulePreview> {
     const query = this.ruleQuery(rule);
-    const params = new URLSearchParams({ q: query, maxResults: "1" });
-    const data = await this.api<any>(`${GMAIL}/messages?${params}`);
-    const matched = data.resultSizeEstimate ?? 0;
-    return { matched, estimatedBytes: matched * 300 * 1024, query };
+    // Gmail's resultSizeEstimate is approximate, so page real ids up to the
+    // same cap runRule will use — that way the number shown is the number
+    // actually acted on, and `capped` tells the UI when more remain.
+    const ids = await this.listIds(query, RULE_CAP);
+    const capped = ids.length >= RULE_CAP;
+
+    // Derive mean size from a real sample instead of a hardcoded guess.
+    let estimatedBytes = 0;
+    if (ids.length) {
+      const sample = await this.getMetadata(ids.slice(0, SIZE_SAMPLE));
+      const meanBytes = sample.length
+        ? sample.reduce((a, m) => a + m.sizeBytes, 0) / sample.length
+        : 0;
+      estimatedBytes = Math.round(meanBytes * ids.length);
+    }
+    return { matched: ids.length, estimatedBytes, query, capped };
   }
 
   async runRule(rule: Rule): Promise<TrashResult> {
-    const ids = await this.listIds(this.ruleQuery(rule), 2000);
+    const ids = await this.listIds(this.ruleQuery(rule), RULE_CAP);
     if (ids.length) await this.trashMessages(ids);
     return { count: ids.length, ids };
   }

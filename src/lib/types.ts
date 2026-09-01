@@ -53,6 +53,8 @@ export interface RulePreview {
   matched: number;
   estimatedBytes: number;
   query: string;
+  /** True when more messages match than one run will trash (see RULE_CAP). */
+  capped: boolean;
 }
 
 /**

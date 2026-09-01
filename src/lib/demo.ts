@@ -244,7 +244,7 @@ export class DemoProvider implements MailProvider {
 
   previewRule(rule: Rule): Promise<RulePreview> {
     const { matched, estimatedBytes, query } = this.matchRule(rule);
-    return this.delay({ matched, estimatedBytes, query }, 400);
+    return this.delay({ matched, estimatedBytes, query, capped: false }, 400);
   }
 
   runRule(rule: Rule): Promise<TrashResult> {

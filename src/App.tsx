@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import type { MailProvider, Overview, Recommendation, Rule, TrashResult } from "./lib/types";
+import type { MailProvider, Overview, Recommendation, Rule, RulePreview, TrashResult } from "./lib/types";
 import { DemoProvider } from "./lib/demo";
 import { GmailProvider, consumeRedirectToken, startGoogleSignIn } from "./lib/gmail";
 import { buildRecommendations } from "./lib/triage";
@@ -8,6 +8,12 @@ import { fmtBytes, fmtDate, fmtNum } from "./lib/format";
 type Confirm = {
   title: string;
   body: string;
+  /**
+   * Bytes this action is expected to free. Carried as data — it used to be
+   * re-parsed out of `body` with a regex, which made user-facing copy
+   * load-bearing (rewording the sentence silently zeroed the accounting).
+   */
+  estimatedBytes: number;
   run: () => Promise<TrashResult>;
 };
 
@@ -133,7 +139,9 @@ export default function App() {
   const askTrashSelected = () =>
     setConfirm({
       title: `Trash ${selected.size} selected emails?`,
-      body: `Frees ~${fmtBytes(selectedBytes)}. They move to Gmail's Trash — recoverable for 30 days, nothing is permanently deleted.`,
+      // Exact, not estimated — these sizes come from the messages themselves.
+      body: `Frees ${fmtBytes(selectedBytes)}. They move to Gmail's Trash — recoverable for 30 days, nothing is permanently deleted.`,
+      estimatedBytes: selectedBytes,
       run: () => provider.trashMessages([...selected]),
     });
 
@@ -191,6 +199,7 @@ export default function App() {
                     setConfirm({
                       title: r.title,
                       body: `${r.detail} Everything goes to Trash (recoverable for 30 days).`,
+                      estimatedBytes: r.estimatedBytes,
                       run: () =>
                         r.action.kind === "sender"
                           ? provider.trashSender(r.action.email)
@@ -209,7 +218,7 @@ export default function App() {
           <div className="section-head">
             <div>
               <h2>Largest emails</h2>
-              <p className="section-sub">Everything over 5 MB, biggest first.</p>
+              <p className="section-sub">Your biggest emails over 1 MB, largest first.</p>
             </div>
             <button className="btn btn-danger" disabled={selected.size === 0 || busy} onClick={askTrashSelected}>
               Trash {selected.size > 0 ? `${selected.size} selected (${fmtBytes(selectedBytes)})` : "selected"}
@@ -263,7 +272,11 @@ export default function App() {
 
         <div className="two-col">
           <section>
-            <h2>Top senders by storage</h2>
+            <h2>Top senders among your largest emails</h2>
+            <p className="section-sub">
+              Ranked from the big emails scanned above — a sender of many small emails may not appear
+              here yet. "Trash all" still covers every email from that sender.
+            </p>
             <table className="table">
               <thead>
                 <tr>
@@ -289,7 +302,8 @@ export default function App() {
                         onClick={() =>
                           setConfirm({
                             title: `Trash all mail from ${s.name}?`,
-                            body: `${fmtNum(s.count)} emails, ~${fmtBytes(s.totalBytes)}. Starred and important mail is kept. Recoverable from Trash for 30 days.`,
+                            body: `At least ${fmtNum(s.count)} emails (${fmtBytes(s.totalBytes)}) from your largest mail, plus any smaller ones from this sender. Starred and important mail is kept. Recoverable from Trash for 30 days.`,
+                            estimatedBytes: s.totalBytes,
                             run: () => provider.trashSender(s.email),
                           })
                         }
@@ -339,12 +353,7 @@ export default function App() {
               <button
                 className="btn btn-danger"
                 disabled={busy}
-                onClick={() => {
-                  const est =
-                    recs.find((r) => r.title === confirm.title)?.estimatedBytes ??
-                    (confirm.title.includes("selected") ? selectedBytes : estimateFromBody(confirm.body));
-                  execute(confirm, est);
-                }}
+                onClick={() => execute(confirm, confirm.estimatedBytes)}
               >
                 {busy ? "Working…" : "Move to Trash"}
               </button>
@@ -365,13 +374,6 @@ export default function App() {
       )}
     </div>
   );
-}
-
-function estimateFromBody(body: string): number {
-  const m = body.match(/~([\d.]+)\s*(B|KB|MB|GB)/);
-  if (!m) return 0;
-  const mult = { B: 1, KB: 1024, MB: 1024 ** 2, GB: 1024 ** 3 }[m[2] as "B" | "KB" | "MB" | "GB"];
-  return Math.round(parseFloat(m[1]) * mult);
 }
 
 function Landing(props: {
@@ -488,7 +490,7 @@ function RuleBuilder({
 }) {
   const [olderThan, setOlderThan] = useState(365);
   const [category, setCategory] = useState("CATEGORY_PROMOTIONS");
-  const [preview, setPreview] = useState<{ matched: number; estimatedBytes: number; query: string } | null>(null);
+  const [preview, setPreview] = useState<RulePreview | null>(null);
   const [previewing, setPreviewing] = useState(false);
 
   const rule: Rule = { olderThanDays: olderThan, category: category || undefined };
@@ -543,7 +545,10 @@ function RuleBuilder({
                 onExecute(
                   {
                     title: `Trash ${fmtNum(preview.matched)} matching emails?`,
-                    body: `Query: ${preview.query}. Estimated ~${fmtBytes(preview.estimatedBytes)}. Recoverable from Trash for 30 days.`,
+                    body: `Query: ${preview.query}. Estimated ~${fmtBytes(preview.estimatedBytes)}${
+                      preview.capped ? ", the most this run will trash — run it again to continue" : ""
+                    }. Recoverable from Trash for 30 days.`,
+                    estimatedBytes: preview.estimatedBytes,
                     run: () => provider.runRule(rule),
                   },
                   preview.estimatedBytes
